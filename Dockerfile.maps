@@ -1,0 +1,38 @@
+# The expensive analysis happens in this stage and is not charged at run time.
+FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90 AS builder
+
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+WORKDIR /app
+
+COPY requirements.lock /app/requirements.lock
+RUN pip install --no-cache-dir -r /app/requirements.lock \
+    'coverage==7.13.3' 'pytest-cov==7.0.0'
+
+COPY fetch_sqlglot.py build_maps.py blast_plugin.py /app/
+RUN python /app/fetch_sqlglot.py
+WORKDIR /opt/sqlglot
+
+# --cov-context=test records the tests that executed each source line.
+# blast_plugin separately records fixture reads and imports during collection.
+# The baseline checkout is pinned; no sample patch or answer file is used here.
+RUN PYTHONPATH=/app:/opt/sqlglot BLAST_SQLGLOT_ROOT=/opt/sqlglot \
+    BLAST_FILE_ACCESS_OUT=/app/file-access.json SKIP_INTEGRATION=0 \
+    python -m pytest -q --disable-warnings --tb=no \
+      -p blast_plugin --cov=sqlglot --cov-context=test --cov-report= && \
+    python /app/build_maps.py --repo /opt/sqlglot \
+      --coverage /opt/sqlglot/.coverage \
+      --file-access /app/file-access.json \
+      --output /app/maps.json.gz && \
+    test -s /app/maps.json.gz && test -s /app/base-source.zip
+
+# A clean runtime image: no pytest, no sqlglot tests, no network dependency.
+FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+WORKDIR /app
+COPY selector.py /app/selector.py
+COPY --from=builder /app/maps.json.gz /app/maps.json.gz
+COPY --from=builder /app/base-source.zip /app/base-source.zip
+CMD ["python", "/app/selector.py"]

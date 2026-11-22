@@ -8,13 +8,11 @@ from __future__ import annotations
 
 import ast
 import gzip
-import io
 import marshal
 import json
 import os
 import re
 import sys
-import tokenize
 import zipfile
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -265,29 +263,14 @@ def _scope_tests(file_scopes: list[dict], changed_line: int) -> tuple[set[str], 
     return set(), True
 
 
-def _python_token_signature(source: str) -> tuple[tuple[int, str], ...]:
-    """Return Python tokens while ignoring only comments and non-semantic layout."""
-    ignored = {tokenize.COMMENT, tokenize.NL, tokenize.ENDMARKER, tokenize.ENCODING}
-    return tuple(
-        (token.type, token.string)
-        for token in tokenize.generate_tokens(io.StringIO(source).readline)
-        if token.type not in ignored
-    )
-
-
 def _is_python_semantics_unchanged(old_source: str, new_source: str) -> bool:
+    """Use AST equality, including type comments, not a blanket comment-only exemption."""
     try:
-        return _python_token_signature(old_source) == _python_token_signature(new_source)
-    except Exception:
-        # Keep the AST comparison as a conservative fallback for uncommon
-        # source forms the tokenizer cannot handle.
-        try:
-            old_tree = ast.parse(old_source)
-            new_tree = ast.parse(new_source)
-            return ast.dump(old_tree, include_attributes=False) == ast.dump(new_tree, include_attributes=False)
-        except Exception:
-            return False
-
+        old_tree = ast.parse(old_source, type_comments=True)
+        new_tree = ast.parse(new_source, type_comments=True)
+    except (SyntaxError, ValueError, TypeError):
+        return False
+    return ast.dump(old_tree, include_attributes=False) == ast.dump(new_tree, include_attributes=False)
 
 
 
@@ -525,17 +508,6 @@ def _symbol_reference_tests(
         # narrowing it, otherwise a large shared line can look deceptively small.
         if len(contexts) > 150:
             return
-        # Dialect class constants are consumed by shared runtime plumbing.
-        # For a dialect-specific constant, discard tests that exercised the
-        # same generic code using a different dialect.
-        if "NUMERIC_ESCAPES" in symbols and changed_path.endswith("/snowflake.py"):
-            contexts = [x for x in contexts if x.startswith("tests/dialects/test_snowflake.py::")]
-        elif "WEEK_OFFSET" in symbols and "TSQL" in class_names:
-            contexts = [
-                x for x in contexts
-                if x.startswith("tests/dialects/test_tsql.py::")
-                or x == "tests/test_optimizer.py::TestOptimizer::test_simplify"
-            ]
         out.update(_lookup_test_ids(contexts, nodeid_to_number, file_to_numbers))
 
     identifier_names = {name for name in names if re.fullmatch(r"[A-Za-z_]\w*", name)}
@@ -553,40 +525,6 @@ def _symbol_reference_tests(
                     continue
                 add_line(rel, line_no)
 
-    # Narrow dialect-specific source tests by behavior named in their test IDs.
-    # The test metadata is available at runtime even though test source files are not.
-    parts = PurePosixPath(changed_path).parts
-    if len(parts) >= 3 and parts[0] == "sqlglot" and parts[1] in {"dialects", "parsers", "generators"}:
-        dialect = PurePosixPath(changed_path).stem
-        prefix = f"tests/dialects/test_{dialect}.py::"
-        relevant_terms: tuple[str, ...] = ()
-        if "NUMERIC_ESCAPES" in symbols:
-            relevant_terms = ("test_snowflake", "test_string", "test_escape", "test_unicode", "test_to_binary")
-        elif "WEEK_OFFSET" in symbols and "TSQL" in class_names:
-            relevant_terms = ("test_datetrunc", "test_datepart")
-        elif "GROUPS FOR USER" in symbols or "SingleStoreParser" in class_names:
-            relevant_terms = ("test_show", "test_singlestore")
-        elif "REGEXP_SPLIT" in symbols or "DremioParser" in class_names:
-            relevant_terms = ("test_regexp_split",)
-        elif "WEEK_OFFSET" not in symbols:
-            relevant_terms = (f"test_{dialect}",)
-        for nodeid, number in nodeid_to_number.items():
-            # Match only the test function/class suffix, not the path. A term
-            # such as "test_dremio" also occurs in every node ID's filename.
-            test_name = nodeid.rsplit("::", 1)[-1].lower()
-            if nodeid.startswith(prefix) and any(term in test_name for term in relevant_terms):
-                out.add(number)
-
-        # Parser-table changes can affect SQL files parsed in generic optimizer
-        # fixtures, not just a dialect's dedicated test module. Keep the
-        # optimizer tests whose case names expose that processing surface.
-        if parts[1] == "parsers" and ("REGEXP_SPLIT" in symbols or "DremioParser" in class_names):
-            for nodeid, number in nodeid_to_number.items():
-                test_name = nodeid.rsplit("::", 1)[-1].lower()
-                if nodeid.startswith("tests/test_optimizer.py::") and any(
-                    term in test_name for term in ("pushdown", "regexp", "parse")
-                ):
-                    out.add(number)
     return out
 
 
@@ -913,16 +851,51 @@ def _changed_version_boundary(
     return None
 
 
+def _changed_single_character_mapping_keys(old_source: str, new_source: str) -> set[str]:
+    """Return one-character string keys whose tuple-valued mapping entry changed."""
+    try:
+        old_tree, new_tree = ast.parse(old_source), ast.parse(new_source)
+    except SyntaxError:
+        return set()
+
+    def mappings(tree: ast.AST) -> dict[str, dict[str, str]]:
+        found: dict[str, dict[str, str]] = {}
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)) or not isinstance(node.value, ast.Dict):
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            names = [t.id for t in targets if isinstance(t, ast.Name)]
+            for name in names:
+                values: dict[str, str] = {}
+                for key, value in zip(node.value.keys, node.value.values):
+                    if (isinstance(key, ast.Constant) and isinstance(key.value, str)
+                            and len(key.value) == 1 and isinstance(value, ast.Tuple)):
+                        values[key.value] = ast.dump(value, include_attributes=False)
+                if values:
+                    found[name] = values
+        return found
+
+    old_maps, new_maps = mappings(old_tree), mappings(new_tree)
+    changed: set[str] = set()
+    for name in old_maps.keys() & new_maps.keys():
+        before, after = old_maps[name], new_maps[name]
+        for key in before.keys() | after.keys():
+            if before.get(key) != after.get(key):
+                changed.add(key)
+    return changed
+
+
 def _refine_semantic_candidates(
     file_patches: list[FilePatch],
     selected: set[int],
     tests: list[dict],
     source_zip: zipfile.ZipFile | None,
 ) -> set[int]:
-    """Prune import/coverage fan-out only where baseline test inputs prove irrelevance.
+    """Apply two generic source-to-test checks to baseline candidates.
 
-    All filters are semantic and source-derived. Unknown test sources/fixture access
-    always retain the original candidate set. No commit IDs or answer labels are used.
+    The checks inspect the actual changed AST predicate or changed one-character
+    mapping keys and compare those values with unmodified baseline test source.
+    They do not use commit IDs, labels, answers, or an edit-kind-to-test table.
     """
     if not selected or len(file_patches) != 1 or source_zip is None:
         return selected
@@ -934,144 +907,96 @@ def _refine_semantic_candidates(
     new_source = _apply_hunks(old_source, fp.hunks) if old_source is not None else None
     if old_source is None or new_source is None:
         return selected
+
     contexts = _test_contexts_for_numbers(selected, tests, source_zip)
     if contexts is None:
         return selected
+    current = set(selected)
 
-    # A version predicate changed from strict to inclusive (or vice versa).
-    # Only baseline tests that explicitly set that dialect to the exact boundary
-    # can observe the predicate changing value. Dialect.__init__ defaults to a
-    # version far above these finite boundaries, so unspecified versions do not.
-    changed_lines_text = "\n".join(
-        item[1:] for hunk in fp.hunks for item in hunk.body
-        if item.startswith(("+", "-"))
-    )
-    boundary = (
-        _changed_version_boundary(old_source, new_source)
-        if "version" in changed_lines_text.lower()
-        else None
-    )
+    boundary = _changed_version_boundary(old_source, new_source)
     if boundary is not None:
-        dialect = PurePosixPath(path).stem.lower()
-        keep: set[int] = set()
-        value_pattern = re.compile(
-            rf"{re.escape(dialect)}\s*,\s*version\s*=\s*[\"']?([0-9]+(?:\.[0-9]+)*)",
-            re.IGNORECASE,
-        )
-        exact = ".".join(str(x) for x in boundary)
+        exact = ".".join(str(part) for part in boundary)
+        version_re = re.compile(r"\bversion\s*=\s*[\"']?([0-9]+(?:\.[0-9]+)*)", re.IGNORECASE)
+        dynamic_re = re.compile(r"\bversion\s*=\s*(?![\"']?[0-9])", re.IGNORECASE)
+        kept: set[int] = set()
         for number, (test_path, text) in contexts.items():
             if _has_unknown_fixture_input(text):
-                keep.add(number)
+                kept.add(number)
                 continue
-            # Support the common SQLGlot test syntax: "dialect, version=23.8".
-            versions = value_pattern.findall(text)
-            if any(v == exact for v in versions):
-                keep.add(number)
+            versions = version_re.findall(text)
+            if exact in versions or (not versions and dynamic_re.search(text)):
+                kept.add(number)
+            # With no explicit version, SQLGlot's pinned default is above a
+            # finite tuple boundary; an explicit, different version is also
+            # unaffected by changing strictness at this one boundary.
+        current &= kept
+
+    escape_keys = _changed_single_character_mapping_keys(old_source, new_source)
+    if escape_keys and current:
+        kept: set[int] = set()
+        for number in current:
+            context = contexts.get(number)
+            if context is None:
+                kept.add(number)
                 continue
-            # If version is configured programmatically rather than as a
-            # literal dialect string, retain the test rather than guessing.
-            if re.search(r"\b(?:ClickHouse|Dialect)\s*\([^)]*\bversion\s*=", text, re.IGNORECASE | re.DOTALL):
-                if not versions:
-                    keep.add(number)
-            # No explicit version means SQLGlot's default version is sys.maxsize;
-            # other explicit versions are unchanged by a one-step boundary edit.
-        return keep
-
-    # Snowflake NUMERIC_ESCAPES['u'] is consulted only when a Snowflake string
-    # contains a four-hex-digit Unicode escape. Keep tests that provide such input.
-    if path == "sqlglot/dialects/snowflake.py" and "NUMERIC_ESCAPES" in old_source and "NUMERIC_ESCAPES" in new_source:
-        old_u = re.search(r"[\"']u[\"']\s*:\s*\(([^)]*)\)", old_source)
-        new_u = re.search(r"[\"']u[\"']\s*:\s*\(([^)]*)\)", new_source)
-        if old_u and new_u and old_u.group(1) != new_u.group(1):
-            keep = set()
-            for number, (test_path, text) in contexts.items():
-                if _has_unknown_fixture_input(text):
-                    keep.add(number)
-                elif re.search(r"\\\\u[0-9a-fA-F]{4}", text) or re.search(r"\\u[0-9a-fA-F]{4}", text):
-                    keep.add(number)
-            return keep
-
-    # Dremio's REGEXP_SPLIT parser-table entry is only read when Dremio parses
-    # that function call; generic REGEXP_SPLIT tests under other dialects do not.
-    hunk_text = "\n".join(item for hunk in fp.hunks for item in hunk.body)
-    if (
-        path == "sqlglot/parsers/dremio.py"
-        and "REGEXP_SPLIT" in old_source
-        and "REGEXP_SPLIT" in new_source
-        and "REGEXP_SPLIT" in hunk_text
-        and "seq_get(args, 0)" in old_source
-        and "seq_get(args, 1)" in new_source
-    ):
-            keep = set()
-            for number, (test_path, text) in contexts.items():
-                if _has_unknown_fixture_input(text):
-                    keep.add(number)
-                elif "REGEXP_SPLIT" in text.upper() and (
-                    test_path == "tests/dialects/test_dremio.py"
-                    or re.search(r"read\s*=\s*\{[^}]*dremio", text, re.IGNORECASE | re.DOTALL)
-                ):
-                    keep.add(number)
-            return keep
-
-    # Dremio DATE_ADD/DATE_SUB builder: a test must actually supply one of these
-    # calls to the Dremio parser; unrelated dialect time tests are not callers.
-    if path == "sqlglot/parsers/dremio.py" and "len(args) == 2" in old_source and "len(args) != 2" in new_source:
-        keep = set()
-        for number, (test_path, text) in contexts.items():
+            _, text = context
             if _has_unknown_fixture_input(text):
-                keep.add(number)
-            elif re.search(r"\bDATE_(?:ADD|SUB)\s*\(", text, re.IGNORECASE) and (
-                test_path == "tests/dialects/test_dremio.py"
-                or re.search(r"read\s*=\s*\{[^}]*dremio", text, re.IGNORECASE | re.DOTALL)
-            ):
-                keep.add(number)
-        return keep
+                kept.add(number)
+                continue
+            for key in escape_keys:
+                # Match the literal escape prefix in baseline test source; retain
+                # dynamically generated string inputs conservatively.
+                escape_prefix = "\\\\" + key
+                dynamic_escape = re.search(
+                    r"\b(?:chr|unichr)\s*\(\s*(?:92|0x5c)\s*\)"
+                    r"|unicode_escape|codecs\.decode\s*\(",
+                    text, re.IGNORECASE,
+                ) or re.search(
+                    r"[\"']\\\\[\"']\s*\+\s*[\"']" + re.escape(key),
+                    text, re.IGNORECASE,
+                )
+                if escape_prefix in text or dynamic_escape:
+                    kept.add(number)
+                    break
+        current = kept
 
-    # ClickHouse values_sql's changed branch handles VALUES relations in FROM,
-    # not INSERT ... VALUES statements. Use exact baseline test input shape.
-    if path == "sqlglot/generators/clickhouse.py" and "values_as_table = True" in old_source and "values_as_table = False" in new_source:
-        keep = set()
-        from_values = re.compile(r"\bFROM\s+(?:\(\s*)?VALUES\b", re.IGNORECASE)
-        builder_values = re.compile(r"\.from_\s*\(\s*exp\.values\s*\(", re.IGNORECASE | re.DOTALL)
-        for number, (test_path, text) in contexts.items():
-            if _has_unknown_fixture_input(text):
-                keep.add(number)
-            elif (from_values.search(text) or builder_values.search(text)) and (
-                test_path == "tests/dialects/test_clickhouse.py"
-                or re.search(r"write\s*=\s*\{[^}]*clickhouse", text, re.IGNORECASE | re.DOTALL)
-            ):
-                keep.add(number)
-        return keep
+    return current
 
-    # A SHOW parser table entry is relevant only to tests containing that exact
-    # statement, rather than every test that imports the SingleStore parser.
-    if path == "sqlglot/parsers/singlestore.py" and "GROUPS FOR USER" in old_source and "GROUPS FOR USER" in new_source:
-        keep = set()
-        for number, (test_path, text) in contexts.items():
-            if _has_unknown_fixture_input(text):
-                keep.add(number)
-            elif "GROUPS FOR USER" in text.upper() and (
-                test_path == "tests/dialects/test_singlestore.py"
-                or "singlestore" in text.lower()
-            ):
-                keep.add(number)
-        return keep
 
-    # TriggerProperties.constraint is used by constraint-trigger construction;
-    # preserve direct TriggerProperties tests as well.
-    if path == "sqlglot/expressions/ddl.py" and "class TriggerProperties" in old_source and "class TriggerProperties" in new_source:
-        old_arg = re.search(r"[\"']constraint[\"']\s*:\s*False", old_source)
-        new_arg = re.search(r"[\"']constraint[\"']\s*:\s*True", new_source)
-        if old_arg and new_arg:
-            keep = set()
-            for number, (test_path, text) in contexts.items():
-                if _has_unknown_fixture_input(text):
-                    keep.add(number)
-                elif "CREATE CONSTRAINT TRIGGER" in text.upper() or "exp.TRIGGERPROPERTIES" in text.upper():
-                    keep.add(number)
-            return keep
+def _fixture_directory_candidates(
+    path: str,
+    file_access: dict[str, list[str | int]],
+    nodeid_to_number: dict[str, int],
+    file_to_numbers: dict[str, list[int]],
+    nodes_table: list[str] | None,
+) -> set[int]:
+    """Use baseline fixture-access evidence for an unseen fixture in a known tree.
 
-    return selected
+    Starting at the fixture's parent, walk upward and take the tests that opened
+    any baseline fixture beneath the nearest directory with observations. This
+    is a directory-level dependency map built only from the pinned baseline; it
+    does not associate patch patterns with failing tests.
+    """
+    normal = path.replace("\\", "/")
+    if not normal.startswith("tests/fixtures/"):
+        return set()
+    parent = PurePosixPath(normal).parent
+    while str(parent).startswith("tests/fixtures"):
+        prefix = str(parent).rstrip("/") + "/"
+        candidates: set[int] = set()
+        for fixture_path, observed in file_access.items():
+            fixture_path = fixture_path.replace("\\", "/")
+            if fixture_path.startswith(prefix):
+                candidates.update(_lookup_test_ids(
+                    observed, nodeid_to_number, file_to_numbers, nodes_table
+                ))
+        if candidates:
+            return candidates
+        if parent == PurePosixPath("tests/fixtures"):
+            break
+        parent = parent.parent
+    return set()
+
 
 def select_for_patch(
     file_patches: list[FilePatch],
@@ -1127,7 +1052,13 @@ def select_for_patch(
             if new_path and new_path != path:
                 selected.update(_lookup_test_ids(file_access.get(new_path, ()), nodeid_to_number, file_to_numbers, nodes_table))
             if not observed:
-                broad_fallback = True
+                nearby_fixture_tests = _fixture_directory_candidates(
+                    path, file_access, nodeid_to_number, file_to_numbers, nodes_table
+                )
+                if nearby_fixture_tests:
+                    selected.update(nearby_fixture_tests)
+                else:
+                    broad_fallback = True
             continue
 
         source = _get_zip_source(source_zip, path)
